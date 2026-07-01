@@ -2,18 +2,19 @@
 """
 舟山警事早报 — 微信公众号要闻推送
 
-每天早上 07:30 自动抓取前一天四个公众号的文章，
-AI 分析总结后推送微信。
+每天 07:30 从 DuckDuckGo 搜索引擎抓取四个公众号前一天的文章，
+AI 分析总结后推送到微信。
 
-公众号源（通过搜索引擎抓取 mp.weixin.qq.com 索引）：
-  - 嵊泗列岛先锋
-  - 嵊泗公安
-  - 舟山公安
-  - 浙江公安
+公众号：嵊泗列岛先锋、嵊泗公安、舟山公安、浙江公安
+
+数据来源：
+  - DuckDuckGo（主力，不封爬虫）
+  - SearXNG 公共实例（兜底）
+  - Bing（最后兜底）
 
 环境变量：
     SERVERCHAN3_SENDKEY  - 必填，推送密钥
-    DEEPSEEK_API_KEY     - 可选，开启 AI 分析
+    DEEPSEEK_API_KEY     - 必填（已配置），开启 AI 分析
     MAX_NEWS_PER_SOURCE  - 可选，每个号最多条数（默认 5）
 """
 
@@ -24,6 +25,7 @@ import json
 import logging
 from datetime import date, datetime, timedelta
 from typing import Optional
+from urllib.parse import quote, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -41,7 +43,6 @@ DEEPSEEK_MODEL = "deepseek-chat"
 YESTERDAY = date.today() - timedelta(days=1)
 YESTERDAY_STR = YESTERDAY.strftime("%Y-%m-%d")
 
-# 要追踪的公众号
 WECHAT_ACCOUNTS = [
     {"name": "嵊泗列岛先锋", "icon": "🚩"},
     {"name": "嵊泗公安", "icon": "🏛️"},
@@ -50,169 +51,236 @@ WECHAT_ACCOUNTS = [
 ]
 
 
-# ============================================================
-# 搜索引擎查找微信文章
-# ============================================================
-
-def search_google_wechat(account_name: str, max_items: int = 5) -> list:
-    """通过 Google 搜索查找公众号文章（site:mp.weixin.qq.com）"""
-    query = f"site:mp.weixin.qq.com {account_name}"
-    UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-          "AppleWebKit/537.36 (KHTML, like Gecko) "
-          "Chrome/125.0.0.0 Safari/537.36")
-
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": UA,
+def make_session() -> requests.Session:
+    """创建带有浏览器特征的请求会话"""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Referer": "https://www.google.com/",
     })
+    return s
 
+
+def clean_title(text: str) -> str:
+    """清洗标题"""
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^[\d.、\s]+", "", text)  # 去掉序号
+    return text
+
+
+def is_wechat_url(url: str) -> bool:
+    """判断是否为微信文章链接"""
+    return "mp.weixin.qq.com" in url
+
+
+# ============================================================
+# 数据源 1: DuckDuckGo HTML 搜索（最可靠）
+# ============================================================
+
+def search_duckduckgo(query: str, max_items: int = 5) -> list:
+    """使用 DuckDuckGo HTML 搜索（不爬虫友好，可自动运行）"""
+    session = make_session()
+    url = "https://html.duckduckgo.com/html/"
+    params = {"q": query, "kl": "cn-zh"}
     items = []
 
-    # ===== Google =====
     try:
-        params = {"q": query, "hl": "zh-CN", "num": str(min(max_items * 2, 10))}
-        resp = session.get(
-            "https://www.google.com/search",
-            params=params,
-            timeout=15,
-            allow_redirects=True,
-        )
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # Google 搜索结果容器
-            for sel in [
-                "div.g",                      # 经典布局
-                "div[data-hveid]",             # 新版
-                "div.kCrYT",                   # 移动版/旧版
-                "div.yuRUbf",                  # 2024+
-                ".MjjYud",                     # 2025+
-            ]:
-                results = soup.select(sel)
-                if results:
+        resp = session.post(url, data=params, timeout=15, allow_redirects=True)
+        if resp.status_code != 200:
+            logger.warning("  DuckDuckGo 返回 %d", resp.status_code)
+            return items
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = soup.select(".result, .web-result, .result__body, .results_links")
+
+        if not results:
+            results = soup.select("div[data-nosnippet] li, .nrn-react-div, .result-title")
+
+        for res in results[:max_items * 3]:
+            if len(items) >= max_items:
+                break
+
+            # DuckDuckGo 的各种结果结构
+            title_el = (
+                res.select_one(".result__title a, .result-title a, a.result__a, .result-title")
+            )
+            link_el = (
+                res.select_one(".result__url, .result__body a, .result-url, a[href]")
+            )
+
+            # 优先找标题链接
+            if title_el:
+                href = title_el.get("href", "")
+                title = title_el.get_text(strip=True)
+            elif link_el:
+                href = link_el.get("href", "")
+                title = link_el.get_text(strip=True) or ""
+            else:
+                continue
+
+            # DuckDuckGo 的链接是重定向格式
+            # 从重定向 URL 中提取真实链接
+            real_url = extract_ddg_url(href)
+            if not real_url or not is_wechat_url(real_url):
+                continue
+
+            title = clean_title(title)
+            if not title or len(title) < 5:
+                continue
+
+            # 提取摘要
+            summary = ""
+            for sel in [".result__snippet", ".result-snippet", ".snippet", "p"]:
+                el = res.select_one(sel)
+                if el:
+                    summary = el.get_text(strip=True)
                     break
 
-            for result in results[:max_items * 2]:
+            items.append({
+                "title": title,
+                "url": real_url,
+                "summary": summary[:200] if summary else "",
+            })
+
+        logger.info("  DuckDuckGo: %d 篇", len(items))
+    except Exception as e:
+        logger.warning("  DuckDuckGo 异常: %s", e)
+
+    return items
+
+
+def extract_ddg_url(url: str) -> str:
+    """从 DuckDuckGo 的重定向 URL 中提取真实地址"""
+    # 格式: //duckduckgo.com/l/?uddg=https%3A%2F%2F...&rut=...
+    match = re.search(r"uddg=([^&]+)", url)
+    if match:
+        from urllib.parse import unquote
+        return unquote(match.group(1))
+    # 或者是直接的 http/https
+    if url.startswith("http"):
+        return url
+    return ""
+
+
+# ============================================================
+# 数据源 2: SearXNG 公共实例搜索
+# ============================================================
+
+def search_searxng(query: str, max_items: int = 5) -> list:
+    """使用 SearXNG 公共实例搜索"""
+    instances = [
+        "https://search.sapti.me",
+        "https://searx.be",
+        "https://searx.work",
+        "https://searx.thegpm.org",
+    ]
+
+    session = make_session()
+    items = []
+
+    for instance in instances:
+        if items:
+            break
+        try:
+            resp = session.get(
+                f"{instance}/search",
+                params={"q": query, "format": "json", "language": "zh-CN"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            for result in data.get("results", []):
                 if len(items) >= max_items:
                     break
-                title_el = result.select_one("h3 a, a[href*='mp.weixin.qq.com']")
-                if not title_el:
-                    title_el = result.select_one("a")
-                if not title_el:
+                url = result.get("url", "")
+                if not is_wechat_url(url):
                     continue
-
-                url = title_el.get("href", "")
-                # Google 搜索结果 URL 有时是 /url?q=... 格式
-                url = extract_google_url(url)
-                if not url or "mp.weixin.qq.com" not in url:
-                    continue
-
-                title = title_el.get_text(strip=True)
+                title = clean_title(result.get("title", ""))
                 if not title or len(title) < 5:
                     continue
-
-                # 摘要
-                summary = ""
-                for sel2 in [".st", ".lEBKkf", ".VwiC3b", "span.aCOpRe", ".fYyStc"]:
-                    el = result.select_one(sel2)
-                    if el:
-                        summary = el.get_text(strip=True)
-                        break
-
                 items.append({
-                    "title": re.sub(r"\s+", " ", title).strip(),
+                    "title": title,
                     "url": url,
-                    "summary": summary[:200] if summary else "",
-                    "source": "Google",
+                    "summary": (result.get("content", "") or "")[:200],
                 })
-    except Exception as e:
-        logger.warning("  Google 搜索异常: %s", e)
+        except Exception as e:
+            logger.debug("  SearXNG %s 失败: %s", instance, e)
+            continue
 
-    return items[:max_items]
+    if items:
+        logger.info("  SearXNG: %d 篇", len(items))
+    return items
 
 
-def search_bing_wechat(account_name: str, max_items: int = 5) -> list:
-    """通过 Bing 搜索查找公众号文章（site:mp.weixin.qq.com）"""
-    query = f"site:mp.weixin.qq.com {account_name}"
-    UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-          "AppleWebKit/537.36 (KHTML, like Gecko) "
-          "Chrome/125.0.0.0 Safari/537.36")
+# ============================================================
+# 数据源 3: Bing 搜索（备胎）
+# ============================================================
 
+def search_bing(query: str, max_items: int = 5) -> list:
+    """使用 Bing 搜索"""
+    session = make_session()
     items = []
     try:
-        resp = requests.get(
+        resp = session.get(
             "https://www.bing.com/search",
             params={"q": query, "setlang": "zh-cn", "count": "10"},
-            headers={
-                "User-Agent": UA,
-                "Accept-Language": "zh-CN,zh;q=0.9",
-                "Referer": "https://www.bing.com/",
-            },
             timeout=15,
         )
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
-            results = soup.select("#b_results li.b_algo, .b_algo, .b_caption")
-            if not results:
-                # 尝试其他选择器
-                results = soup.select("li.b_algo")
-
-            for result in results[:max_items * 2]:
+            for result in soup.select("#b_results li.b_algo, .b_algo"):
                 if len(items) >= max_items:
                     break
                 title_el = result.select_one("h2 a")
                 if not title_el:
                     continue
                 url = title_el.get("href", "")
-                if "mp.weixin.qq.com" not in url:
+                if not is_wechat_url(url):
                     continue
-                title = title_el.get_text(strip=True)
+                title = clean_title(title_el.get_text(strip=True))
                 if not title or len(title) < 5:
                     continue
                 summary_el = result.select_one(".b_caption p, .sn_b_desc")
                 summary = summary_el.get_text(strip=True)[:200] if summary_el else ""
-                items.append({
-                    "title": re.sub(r"\s+", " ", title).strip(),
-                    "url": url,
-                    "summary": summary,
-                    "source": "Bing",
-                })
+                items.append({"title": title, "url": url, "summary": summary})
     except Exception as e:
-        logger.warning("  Bing 搜索异常: %s", e)
+        logger.warning("  Bing 异常: %s", e)
+    if items:
+        logger.info("  Bing: %d 篇", len(items))
+    return items
 
-    return items[:max_items]
 
-
-def extract_google_url(url: str) -> str:
-    """从 Google 搜索结果中提取真实 URL"""
-    # 处理 /url?q=xxx&sa=... 格式
-    match = re.search(r"/url\?q=([^&]+)", url)
-    if match:
-        from urllib.parse import unquote
-        return unquote(match.group(1))
-    return url
-
+# ============================================================
+# 聚合抓取
+# ============================================================
 
 def fetch_account_articles(account: dict, max_items: int = 5) -> list:
-    """抓取单个公众号的文章"""
+    """从多个搜索引擎抓取单个公众号的文章"""
     name = account["name"]
-    icon = account.get("icon", "📰")
     logger.info("正在搜索 [%s]...", name)
 
+    query = f"site:mp.weixin.qq.com {name}"
     all_items = []
 
-    # 1. Google 搜索
-    items = search_google_wechat(name, max_items)
-    logger.info("  Google: %d 篇", len(items))
+    # 1. DuckDuckGo（主力）
+    items = search_duckduckgo(query, max_items)
     all_items.extend(items)
 
-    # 2. Google 没结果 -> Bing 搜索
+    # 2. SearXNG（兜底 1）
     if len(all_items) < max_items:
-        items2 = search_bing_wechat(name, max_items)
-        logger.info("  Bing: %d 篇", len(items2))
+        items2 = search_searxng(query, max_items - len(all_items))
         all_items.extend(items2)
+
+    # 3. Bing（兜底 2）
+    if len(all_items) < max_items:
+        items3 = search_bing(query, max_items - len(all_items))
+        all_items.extend(items3)
 
     # 去重
     seen = set()
@@ -223,8 +291,12 @@ def fetch_account_articles(account: dict, max_items: int = 5) -> list:
             seen.add(key)
             unique.append(a)
 
-    logger.info("  => 共 %d 篇", len(unique[:max_items]))
-    return unique[:max_items]
+    result = unique[:max_items]
+    if result:
+        logger.info("  ✓ 共 %d 篇", len(result))
+    else:
+        logger.warning("  ✗ 未找到文章")
+    return result
 
 
 # ============================================================
@@ -243,10 +315,7 @@ def analyze_with_deepseek(api_key: str, source_data: dict) -> Optional[str]:
         for a in articles:
             t = a["title"]
             s = a.get("summary", "")
-            if s:
-                lines.append(f"- {t}：{s[:100]}")
-            else:
-                lines.append(f"- {t}")
+            lines.append(f"- {t}" + (f"：{s[:100]}" if s else ""))
         lines.append("")
 
     news_text = "\n".join(lines)
@@ -289,9 +358,8 @@ def analyze_with_deepseek(api_key: str, source_data: dict) -> Optional[str]:
             analysis = result["choices"][0]["message"]["content"].strip()
             logger.info("AI 分析完成")
             return analysis
-        else:
-            logger.warning("DeepSeek 返回 %d", resp.status_code)
-            return None
+        logger.warning("DeepSeek 返回 %d", resp.status_code)
+        return None
     except Exception as e:
         logger.warning("AI 分析失败: %s", e)
         return None
@@ -327,9 +395,7 @@ def build_report(source_data: dict, ai_analysis: Optional[str] = None) -> str:
         lines.append(f"━━━ {acc_name} ━━━")
         for i, a in enumerate(articles[:5], 1):
             title = a["title"]
-            if len(title) > 45:
-                title = title[:45] + "…"
-            lines.append(f"{i}. {title}")
+            lines.append(f"{i}. {title[:45] + '…' if len(title) > 45 else title}")
         lines.append("")
 
     lines.append("---")
@@ -351,7 +417,7 @@ def send_serverchan3(sendkey: str, title: str, content: str) -> bool:
         if res.get("code") == 0:
             logger.info("✓ 推送成功！")
             return True
-        logger.error("推送失败: %s", res.get("message", "未知错误"))
+        logger.error("推送失败: %s", res.get("error", res.get("message", "未知错误")))
         return False
     except Exception as e:
         logger.error("推送异常: %s", e)
@@ -371,9 +437,10 @@ def main():
     max_per = int(os.environ.get("MAX_NEWS_PER_SOURCE", "5"))
 
     logger.info("=" * 50)
-    logger.info("舟山警事早报 — 微信公众号文章搜索")
+    logger.info("舟山警事早报")
     logger.info(f"分析日期: {YESTERDAY_STR}")
     logger.info(f"公众号: {', '.join(a['name'] for a in WECHAT_ACCOUNTS)}")
+    logger.info(f"搜索引擎: DuckDuckGo → SearXNG → Bing")
     logger.info("=" * 50)
 
     source_data = {}
@@ -381,19 +448,16 @@ def main():
 
     for acc in WECHAT_ACCOUNTS:
         articles = fetch_account_articles(acc, max_per)
-        name = f"{acc['icon']} {acc['name']}"
-        source_data[name] = articles
+        source_data[f"{acc['icon']} {acc['name']}"] = articles
         total += len(articles)
 
     logger.info(f"\n共获取 {total} 篇文章")
 
-    # AI 分析
     ai = None
     if deepseek_key and total >= 3:
         logger.info("正在 AI 分析...")
         ai = analyze_with_deepseek(deepseek_key, source_data)
 
-    # 构建并推送
     title = f"舟山警事早报 {YESTERDAY_STR}"
     content = build_report(source_data, ai)
     print("\n" + content + "\n")
@@ -401,7 +465,7 @@ def main():
     if total > 0:
         send_serverchan3(sendkey, title, content)
     else:
-        logger.warning("跳过推送")
+        logger.warning("无文章，跳过推送")
 
 
 if __name__ == "__main__":
