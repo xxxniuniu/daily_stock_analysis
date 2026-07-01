@@ -1,0 +1,31 @@
+name: 舟山警事早报
+
+on:
+  schedule:
+    # 每天北京时间 07:30 = UTC 23:30（前一天）
+    - cron: '30 23 * * *'
+  workflow_dispatch:
+
+jobs:
+  police-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: 抓取并推送警情早报
+        env:
+          SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
+          MAX_NEWS_PER_SOURCE: 6
+        run: python scripts/police_news.py
