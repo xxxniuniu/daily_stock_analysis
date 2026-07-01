@@ -30,4 +30,3 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           MAX_NEWS_PER_SOURCE: 5
         run: python scripts/police_news.py
-        run: python scripts/police_news.py
